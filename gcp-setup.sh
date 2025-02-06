@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# run the following command to execute this script
+# wget -qO- https://raw.githubusercontent.com/Findings-co/gcp-cloudvrm/refs/heads/main/gcp-setup.sh | bash
+
 # Set variables
 SERVICE_ACCOUNT_NAME="FindingsCloudVRM"
 ORG_ID=$(gcloud organizations list --format="value(ID)")

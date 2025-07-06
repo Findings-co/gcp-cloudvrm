@@ -1,114 +1,140 @@
 #!/bin/bash
-
-# run the following command to execute this script
+# run this script from Cloud Shell:
 # wget -qO- https://raw.githubusercontent.com/Findings-co/gcp-cloudvrm/refs/heads/main/gcp-setup.sh | bash
 
-# Set variables
-SERVICE_ACCOUNT_NAME="FindingsCloudVRM"
-ORG_ID=$(gcloud organizations list --format="value(ID)")
-PROJECT_ID=$(gcloud config get-value project)
-SERVICE_ACCOUNT_EMAIL="$SERVICE_ACCOUNT_NAME@$PROJECT_ID.iam.gserviceaccount.com"
-KEY_FILE="gcp_findings_cloudvrm.json"
+# Check for gcloud CLI
+command -v gcloud >/dev/null || { echo "Error: gcloud CLI is not installed."; exit 1; }
 
-# Function to handle errors
-echo_error() {
-  echo -e "\e[31m[ERROR]\e[0m $1"
+BASE_SA_NAME="FindingsCloudVRM"
+SERVICE_ACCOUNT_NAME=""
+PROJECT_ID=""
+ORG_ID=""
+UNINSTALL=false
+
+usage() {
+  echo "Usage: $0 [options]"
+  echo
+  echo "Options:"
+  echo "  --service-account-name NAME   Specify the service account name"
+  echo "  --project PROJECT_ID          Specify the GCP project ID (default: gcloud config get-value project)"
+  echo "  --org-id ORG_ID               Specify the GCP organization ID (default: first listed org)"
+  echo "  --uninstall                   Uninstall the specified service account (requires --service-account-name)"
+  echo "  --help, -h                    Show this help message"
 }
 
-echo_success() {
-  echo -e "\e[32m[SUCCESS]\e[0m $1"
+# Parse command-line arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --service-account-name)
+      if [[ $# -lt 2 ]]; then echo "Error: --service-account-name requires an argument."; usage; exit 1; fi
+      SERVICE_ACCOUNT_NAME="$2"; shift 2;;
+    --project)
+      if [[ $# -lt 2 ]]; then echo "Error: --project requires an argument."; usage; exit 1; fi
+      PROJECT_ID="$2"; shift 2;;
+    --org-id)
+      if [[ $# -lt 2 ]]; then echo "Error: --org-id requires an argument."; usage; exit 1; fi
+      ORG_ID="$2"; shift 2;;
+    --uninstall)
+      UNINSTALL=true; shift;;
+    --help|-h)
+      usage; exit 0;;
+    *)
+      echo "Unknown option: $1"; usage; exit 1;;
+  esac
+done
+
+check_sa_exists() {
+  gcloud iam service-accounts list \
+    --filter="email:${SERVICE_ACCOUNT_EMAIL}" \
+    --format="value(email)" | grep -q .
 }
 
-echo_info() {
-  echo -e "\e[34m[INFO]\e[0m $1"
-}
-
-# Check for --uninstall flag
-if [[ "$1" == "--uninstall" ]]; then
-  echo_info "Uninstalling service account: $SERVICE_ACCOUNT_NAME..."
-  
-  echo_info "Removing IAM policy bindings..."
-  gcloud organizations remove-iam-policy-binding $ORG_ID \
-    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-    --role="roles/securitycenter.findingsViewer"
-  gcloud organizations remove-iam-policy-binding $ORG_ID \
-    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-    --role="roles/viewer"
-  
-  echo_info "Deleting service account..."
-  if gcloud iam service-accounts delete $SERVICE_ACCOUNT_EMAIL --quiet; then
-    echo_success "Service account deleted successfully."
-  else
-    echo_error "Failed to delete service account."
+uninstall_sa() {
+  if [[ -z "$SERVICE_ACCOUNT_NAME" ]]; then
+    echo "❌ ERROR: --uninstall requires --service-account-name"
+    usage
+    exit 1
   fi
-  
-  echo_info "Removing key file..."
-  rm -f $KEY_FILE && echo_success "Key file removed."
-  
-  echo_success "Uninstallation complete."
+
+  [[ -z "$PROJECT_ID" ]] && PROJECT_ID=$(gcloud config get-value project)
+
+  if [[ "$SERVICE_ACCOUNT_NAME" == *@* ]]; then
+    SERVICE_ACCOUNT_EMAIL="$SERVICE_ACCOUNT_NAME"
+  else
+    SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  fi
+
+  [[ -z "$ORG_ID" ]] && ORG_ID=$(gcloud organizations list --format="value(ID)" --limit=1)
+
+  echo "Removing SCC findingsViewer binding for ${SERVICE_ACCOUNT_EMAIL}…"
+  FOUND=$(gcloud organizations get-iam-policy "$ORG_ID" \
+    --flatten="bindings[].members" \
+    --filter="bindings.role=roles/securitycenter.findingsViewer AND bindings.members:serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --format="value(bindings.role)")
+  if [[ -n "$FOUND" ]]; then
+    gcloud organizations remove-iam-policy-binding "$ORG_ID" \
+      --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+      --role="roles/securitycenter.findingsViewer"
+    echo "✔️  Removed findingsViewer."
+  else
+    echo "— No findingsViewer binding found, skipping."
+  fi
+
+  echo "Deleting service account ${SERVICE_ACCOUNT_EMAIL}…"
+  gcloud iam service-accounts delete "${SERVICE_ACCOUNT_EMAIL}" --quiet || {
+    echo "❌ ERROR: Failed to delete service account."
+    exit 1
+  }
+
+  KEY_FILE="$(basename "${SERVICE_ACCOUNT_EMAIL%@*}")-key.json"
+  echo "Removing key file ${KEY_FILE}…"
+  rm -f "${KEY_FILE}" || echo "⚠️ Warning: Could not remove key file."
+
+  echo "✅ Uninstallation complete."
   exit 0
-fi
+}
 
-# Retrieve and display the Organization ID
-echo_info "Retrieved Organization ID: $ORG_ID"
+install_sa() {
+  [[ -z "$SERVICE_ACCOUNT_NAME" ]] && SERVICE_ACCOUNT_NAME="${BASE_SA_NAME}-$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
+  [[ -z "$PROJECT_ID" ]] && PROJECT_ID=$(gcloud config get-value project)
+  [[ -z "$ORG_ID" ]] && ORG_ID=$(gcloud organizations list --format="value(ID)" --limit=1)
+  SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  KEY_FILE="${SERVICE_ACCOUNT_NAME}-key.json"
 
-# Get the active project ID
-echo_info "Active Project ID: $PROJECT_ID"
+  echo "Creating service account ${SERVICE_ACCOUNT_NAME} in project ${PROJECT_ID}..."
+  gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
+    --project="${PROJECT_ID}" \
+    --display-name="Findings CloudVRM" || { echo "❌ ERROR: Could not create service account."; exit 1; }
 
-# Create a new service account
-echo_info "Creating service account: $SERVICE_ACCOUNT_NAME..."
-if ! gcloud iam service-accounts create $SERVICE_ACCOUNT_NAME --display-name "Findings CloudVRM"; then
-  echo_error "Service account ID '$SERVICE_ACCOUNT_NAME' already exists or another error occurred."
-  exit 1
-fi
+  echo "Assigning Security Center Findings Viewer role..."
+  gcloud organizations add-iam-policy-binding "${ORG_ID}" \
+    --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role="roles/securitycenter.findingsViewer" || { echo "❌ ERROR: Failed to bind findingsViewer."; exit 1; }
 
-echo_success "Service account '$SERVICE_ACCOUNT_NAME' created successfully."
+  echo "Generating service account key ${KEY_FILE}..."
+  gcloud iam service-accounts keys create "${KEY_FILE}" \
+    --iam-account="${SERVICE_ACCOUNT_EMAIL}" || { echo "❌ ERROR: Failed to generate key."; exit 1; }
 
-# Assign Security Center Findings Viewer role to the service account
-echo_info "Assigning Security Center Findings Viewer role..."
-if gcloud organizations add-iam-policy-binding $ORG_ID \
-  --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-  --role="roles/securitycenter.findingsViewer"; then
-  echo_success "Security Center Findings Viewer role assigned."
+  echo "Enabling Security Command Center API..."
+  gcloud services enable securitycenter.googleapis.com \
+    --project="${PROJECT_ID}" || { echo "❌ ERROR: Failed to enable API."; exit 1; }
+
+  echo -e "
+Installation Summary
+===================="
+  echo "Service Account Email: ${SERVICE_ACCOUNT_EMAIL}"
+  echo "Organization ID: ${ORG_ID}"
+  echo "Key File: ${KEY_FILE}"
+  echo
+  echo "To download the key file from Cloud Shell, run:"
+  echo "  cloudshell download ${KEY_FILE}"
+  echo "Or click the three dots in the Cloud Shell window and select 'Download'."
+  echo "✅ Setup completed successfully."
+}
+
+# Main logic
+if [[ "${UNINSTALL}" == true ]]; then
+  uninstall_sa
 else
-  echo_error "Failed to assign Security Center Findings Viewer role."
+  install_sa
 fi
-
-# Assign Viewer role to the service account
-echo_info "Assigning Viewer role..."
-if gcloud organizations add-iam-policy-binding $ORG_ID \
-  --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-  --role="roles/viewer"; then
-  echo_success "Viewer role assigned."
-else
-  echo_error "Failed to assign Viewer role."
-fi
-
-# Generate and download the service account key
-echo_info "Generating service account key: $KEY_FILE..."
-if gcloud iam service-accounts keys create $KEY_FILE --iam-account=$SERVICE_ACCOUNT_EMAIL; then
-  echo_success "Service account key generated successfully."
-else
-  echo_error "Failed to generate service account key."
-  exit 1
-fi
-
-# Enable Security Command Center API
-echo_info "Enabling Security Command Center API..."
-if gcloud services enable securitycenter.googleapis.com; then
-  echo_success "Security Command Center API enabled."
-else
-  echo_error "Failed to enable Security Command Center API."
-  exit 1
-fi
-
-# Installation summary
-echo -e "\n\e[32m=========================\e[0m"
-echo -e "\e[32m Installation Summary \e[0m"
-echo -e "\e[32m=========================\e[0m"
-echo_success "Setup completed successfully!"
-echo_info "Organization ID: $ORG_ID"
-echo_info "Service account: $SERVICE_ACCOUNT_EMAIL"
-echo_info "To download the key file, use: \e[33mcat $KEY_FILE\e[0m or click on the three dots in the Cloud Shell menu and select 'Download'."
-echo -e "\e[32m=========================\e[0m"
-
